@@ -86,6 +86,8 @@ pub struct StackProfile {
     pub port_steer: PortSteer,
     pub confidence: Confidence,
     pub warnings: Vec<String>,
+    /// package.json script names (node family only; empty elsewhere)
+    pub scripts: Vec<String>,
     /// file whose hash decides whether BOTTLE can be skipped on re-runs
     pub hash_source: Option<PathBuf>,
     /// directory whose presence means deps are already installed
@@ -153,6 +155,7 @@ pub fn resolve(ev: &Evidence) -> Option<StackProfile> {
             port_steer: PortSteer::PortEnv,
             confidence: Confidence::Exact,
             warnings,
+            scripts: vec![],
             hash_source: Some(ev.root.join("Cargo.lock")).filter(|p| p.exists())
                 .or(Some(ev.root.join("Cargo.toml"))),
             artifact_dir: Some("target"),
@@ -169,6 +172,7 @@ pub fn resolve(ev: &Evidence) -> Option<StackProfile> {
             default_port: None,
             port_steer: PortSteer::PortEnv,
             confidence: Confidence::Inferred,
+            scripts: vec![],
             warnings: if available("go") { vec![] } else { vec!["go not found on PATH".into()] },
             hash_source: Some(ev.root.join("go.sum")).filter(|p| p.exists())
                 .or(Some(ev.root.join("go.mod"))),
@@ -186,6 +190,7 @@ pub fn resolve(ev: &Evidence) -> Option<StackProfile> {
             default_port: Some(4567),
             port_steer: PortSteer::ArgFlag("-p"),
             confidence: Confidence::Guessed,
+            scripts: vec![],
             warnings: vec!["ruby entrypoint guessed as app.rb".into()],
             hash_source: Some(ev.root.join("Gemfile.lock")).filter(|p| p.exists())
                 .or(Some(ev.root.join("Gemfile"))),
@@ -203,6 +208,7 @@ pub fn resolve(ev: &Evidence) -> Option<StackProfile> {
             default_port: None,
             port_steer: PortSteer::Fixed, // the icebox picks a free port itself
             confidence: Confidence::Exact,
+            scripts: vec![],
             warnings: vec![],
             hash_source: None,
             artifact_dir: None,
@@ -293,6 +299,7 @@ fn resolve_node(ev: &Evidence) -> StackProfile {
         port_steer,
         confidence,
         warnings,
+        scripts: pj.scripts.clone(),
         hash_source,
         artifact_dir: Some("node_modules"),
     }
@@ -394,6 +401,7 @@ fn resolve_python(ev: &Evidence) -> StackProfile {
         port_steer,
         confidence,
         warnings,
+        scripts: vec![],
         hash_source: [
             "uv.lock", "requirements.txt", "pyproject.toml",
         ]

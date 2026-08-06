@@ -37,3 +37,22 @@
 - Custom title bar — the native Windows bar breaks the CRT aesthetic; Tauri overlay decorations would let the chrome go full milk-noir. (Largest item here, purely cosmetic.)
 
 ------
+
+## MIVIM DELIVERY NOTES — round 4 (2026-08-06)
+
+[001], [002], and [003] are implemented (one deliberate deferral, below). Verified: 18/18 `cargo test`, `svelte-check` 0/0, `vite build`, live-app screenshot of the restored-bottle view.
+
+**[001] — all delivered**
+- Resting screen for capped/empty bottles: art + name + `NODE · npm · vite` badges + path + last URL (when the ledger has one) + hints. `restore_crate` now sends glyph/manager/framework/last_url (glyph fixed: `N`, not `NO`).
+- Every route's lines are mirrored to `app_data/logs/<hash>.log` (truncated per pour); a restored bottle lazily replays it into the L scrollback via the new `bottle_log` command. Removed bottles delete their log.
+- Selecting a crate slot only selects. Re-pour is explicit: slip RE-POUR button (now also for CAPPED), the `R` key, or `pour`.
+- Status strip: bottle name, clickable URL when fresh, and `—` instead of a fake timer on restored bottles (timer also now resets per pour).
+
+**[002] — all delivered, mostly through the CLI**
+- Prompt bar under the terminal with live bash-ish highlighting (valid command = butter, unknown = spoiled red, flags = cold, numbers = fresh), input history (↑/↓ inside the input), and a `cmd?` dropdown that inserts curated commands — including real `pour --script <name>` entries read from the package's own package.json.
+- Command set: `pour [--port n] [--script name] [--watch] [--open]` · `cap` · `open` · `reveal` · `env` · `copy` · `watch [off]` · `clear` · `help`. Echoed into the terminal as `$ …` lines with results.
+- Backend: `rerun_bottle` accepts port/script overrides (sticky across watch re-pours, replaced by each explicit pour); `watch_bottle` (notify crate, 700ms debounce, ignores node_modules/.git/dist/build/target/.venv); `bootstrap_env` (.env from .env.example, then re-pour); `--open`/auto-open handled frontend-side on FRESH.
+
+**[003]**
+- Hint chips in the status strip (`^C cap · L log · R pour · ↕ crate`), ↑/↓ crate navigation, Ctrl +/−/0 terminal zoom (persisted), and the M tile now opens an About/Settings panel (auto-open toggle, zoom, hotkeys, CLI reference, port list).
+- **Deferred: custom title bar.** Overlay decorations + hand-rolled min/max/close need careful per-OS testing to not regress dragging/snap; parked so this round's features land solid. Say the word and it's next.

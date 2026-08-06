@@ -11,10 +11,12 @@ mod statics;
 use dairy::Chunk;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::io::{LineWriter, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 // ---------------------------------------------------------------- events
@@ -34,6 +36,7 @@ struct ProfileView {
     manager: String,
     framework: Option<String>,
     confidence: String,
+    scripts: Vec<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -53,15 +56,33 @@ pub struct BottleInfo {
     state: String,
     stack: Option<String>,
     glyph: Option<String>,
+    manager: Option<String>,
+    framework: Option<String>,
+    last_url: Option<String>,
+    restored: bool,
+}
+
+#[derive(Clone, Serialize)]
+struct LogLine {
+    kind: String,
+    text: String,
 }
 
 fn emit_line(app: &AppHandle, bottle: u32, kind: &str, text: impl Into<String>) {
+    let text = text.into();
+    // mirror every finished line into the bottle's last-log file so a
+    // restored bottle can replay its previous route
+    if let Some(milk) = app.try_state::<Milk>() {
+        if let Some(w) = milk.logs.lock().unwrap().get_mut(&bottle) {
+            let _ = writeln!(w, "{kind}\t{text}");
+        }
+    }
     let _ = app.emit(
         "route:line",
         LinePayload {
             bottle,
             kind: kind.into(),
-            text: text.into(),
+            text,
             rewrite: false,
         },
     );
@@ -106,10 +127,33 @@ fn profile_view(p: &resolver::StackProfile) -> ProfileView {
         manager: p.manager.clone(),
         framework: p.framework.clone(),
         confidence: p.confidence.label().into(),
+        scripts: p.scripts.clone(),
+    }
+}
+
+/// Glyph for a stack label persisted in the ledger (restored bottles).
+fn glyph_for(stack: &str) -> &'static str {
+    match stack {
+        "NODE" => "N",
+        "PYTHON" => "PY",
+        "RUST" => "RS",
+        "GO" => "GO",
+        "RUBY" => "RB",
+        "STATIC" => "ST",
+        _ => "?",
     }
 }
 
 // ---------------------------------------------------------------- state
+
+/// Per-pour overrides set by the CLI (`pour --port N --script name`).
+/// Sticky until the next explicit pour replaces them, so watch-triggered
+/// re-pours keep the user's choices.
+#[derive(Clone, Default)]
+struct RouteOverrides {
+    port: Option<u16>,
+    script: Option<String>,
+}
 
 struct Ctl {
     path: PathBuf,
@@ -117,6 +161,22 @@ struct Ctl {
     cancel: Arc<AtomicBool>,
     brew: Arc<Mutex<Option<dairy::Brew>>>,
     icebox: Arc<Mutex<Option<statics::Icebox>>>,
+    overrides: Arc<Mutex<RouteOverrides>>,
+    watcher: Arc<Mutex<Option<notify::RecommendedWatcher>>>,
+}
+
+impl Ctl {
+    fn new(path: PathBuf, name: String) -> Ctl {
+        Ctl {
+            path,
+            name,
+            cancel: Arc::new(AtomicBool::new(false)),
+            brew: Arc::new(Mutex::new(None)),
+            icebox: Arc::new(Mutex::new(None)),
+            overrides: Arc::new(Mutex::new(RouteOverrides::default())),
+            watcher: Arc::new(Mutex::new(None)),
+        }
+    }
 }
 
 struct Milk {
@@ -125,20 +185,32 @@ struct Milk {
     ledger: Arc<Mutex<ledger::Ledger>>,
     ledger_file: PathBuf,
     workspace: PathBuf,
+    logs_dir: PathBuf,
+    /// open last-log files, keyed by bottle id — emit_line mirrors into these
+    logs: Mutex<HashMap<u32, LineWriter<std::fs::File>>>,
 }
 
 impl Milk {
     fn new(data_dir: PathBuf) -> Self {
         let ledger_file = data_dir.join("ledger.json");
         let workspace = data_dir.join("workspace");
+        let logs_dir = data_dir.join("logs");
         let _ = std::fs::create_dir_all(&workspace);
+        let _ = std::fs::create_dir_all(&logs_dir);
         Milk {
             bottles: Mutex::new(HashMap::new()),
             next: AtomicU32::new(1),
             ledger: Arc::new(Mutex::new(ledger::Ledger::load(&ledger_file))),
             ledger_file,
             workspace,
+            logs_dir,
+            logs: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn log_path(&self, package: &Path) -> PathBuf {
+        self.logs_dir
+            .join(format!("{}.log", ledger::hash_str(&package.to_string_lossy())))
     }
 }
 
@@ -214,6 +286,7 @@ fn run_route(
     icebox_slot: Arc<Mutex<Option<statics::Icebox>>>,
     ledger: Arc<Mutex<ledger::Ledger>>,
     ledger_file: PathBuf,
+    overrides: RouteOverrides,
 ) {
     let canceled = || cancel.load(Ordering::SeqCst);
 
@@ -231,12 +304,29 @@ fn run_route(
         emit_line(&app, id, "tree", " \u{2514}\u{2500} nothing recognizable");
     }
 
-    let Some(profile) = resolver::resolve(&ev) else {
+    let Some(mut profile) = resolver::resolve(&ev) else {
         emit_line(&app, id, "err", "SPOILED \u{2500} no runnable stack detected in this package");
         emit_line(&app, id, "note", "expected one of: package.json, pyproject.toml, requirements.txt, Cargo.toml, go.mod, Gemfile, index.html");
         emit_state(&app, id, "spoiled", None, None, None);
         return;
     };
+
+    // CLI `pour --script <name>`: run a chosen manager script instead of
+    // the resolver's pick (node-family packages only)
+    if let Some(script) = &overrides.script {
+        let node_family = profile.scripts.iter().any(|s| s == script)
+            || matches!(profile.stack, resolver::Stack::Node);
+        if node_family && profile.manager != "builtin" {
+            profile.run_cmd = vec![profile.manager.clone(), "run".into(), script.clone()];
+            profile.stack = resolver::Stack::Node;
+            if !profile.scripts.iter().any(|s| s == script) {
+                emit_line(&app, id, "warn", format!(" ! \"{script}\" is not in package.json scripts \u{2500} pouring anyway"));
+            }
+            emit_line(&app, id, "note", format!(" script override \u{2500} \"{script}\""));
+        } else {
+            emit_line(&app, id, "warn", " ! --script only applies to node packages \u{2500} ignored");
+        }
+    }
 
     let fw = profile
         .framework
@@ -315,6 +405,7 @@ fn run_route(
     // record in the ledger now that deps are known-good
     {
         let mut led = ledger.lock().unwrap();
+        let last_url = led.get(&root).and_then(|e| e.last_url.clone());
         led.upsert(ledger::Entry {
             path: root.clone(),
             name: dir_name(&root),
@@ -322,6 +413,7 @@ fn run_route(
             stack: profile.stack.label().into(),
             manager: profile.manager.clone(),
             framework: profile.framework.clone(),
+            last_url,
         });
         led.save(&ledger_file);
     }
@@ -377,9 +469,22 @@ fn run_route(
     let mut tried_ports: Vec<u16> = Vec::new();
     let mut repours = 0usize;
 
-    // if the stack's own port is already visibly taken, don't bother
-    // crashing into it — steer to a free one up front
-    if let Some(dp) = profile.default_port {
+    // CLI `pour --port <n>` pins the doorstep explicitly; otherwise, if
+    // the stack's own port is already visibly taken, steer to a free one
+    // up front instead of crashing into it
+    if let Some(p) = overrides.port {
+        match profile.run_with_port(p) {
+            Some((cmd, env)) => {
+                emit_line(&app, id, "note", format!(" port override \u{2500} {p}"));
+                tried_ports.push(p);
+                run_cmd = cmd;
+                run_env = env;
+            }
+            None => {
+                emit_line(&app, id, "warn", " ! this stack's port can't be steered \u{2500} --port ignored");
+            }
+        }
+    } else if let Some(dp) = profile.default_port {
         if TcpListener::bind(("127.0.0.1", dp)).is_err() {
             tried_ports.push(dp);
             if let Some((cmd, env, port)) = steer_to_free_port(&profile, &tried_ports) {
@@ -424,6 +529,13 @@ fn run_route(
                         .parse::<u16>()
                         .ok()
                 });
+                // remember the doorstep for the next restore
+                {
+                    let mut led = ledger.lock().unwrap();
+                    if led.set_url(&root, &url) {
+                        led.save(&ledger_file);
+                    }
+                }
                 emit_line(&app, id, "url", format!(" \u{25cf} FRESH \u{2500} {url}"));
                 emit_state(&app, id, "fresh", Some(url), port, Some(profile_view(&profile)));
             }
@@ -494,6 +606,12 @@ fn spawn_route(app: &AppHandle, milk: &Milk, id: u32) {
     let bottles = milk.bottles.lock().unwrap();
     let Some(ctl) = bottles.get(&id) else { return };
     ctl.cancel.store(false, Ordering::SeqCst);
+    // (re)open this bottle's last-log file — one route per file, truncated
+    // at the start of every pour
+    if let Ok(f) = std::fs::File::create(milk.log_path(&ctl.path)) {
+        milk.logs.lock().unwrap().insert(id, LineWriter::new(f));
+    }
+    let overrides = ctl.overrides.lock().unwrap().clone();
     let app = app.clone();
     let path = ctl.path.clone();
     let cancel = ctl.cancel.clone();
@@ -502,7 +620,7 @@ fn spawn_route(app: &AppHandle, milk: &Milk, id: u32) {
     let ledger = milk.ledger.clone();
     let ledger_file = milk.ledger_file.clone();
     std::thread::spawn(move || {
-        run_route(app, id, path, cancel, brew, icebox, ledger, ledger_file);
+        run_route(app, id, path, cancel, brew, icebox, ledger, ledger_file, overrides);
     });
 }
 
@@ -541,6 +659,10 @@ fn load_project(app: AppHandle, milk: State<Milk>, path: String) -> Result<Bottl
                 state: "inspecting".into(),
                 stack: None,
                 glyph: None,
+                manager: None,
+                framework: None,
+                last_url: None,
+                restored: false,
             };
             cap_bottle(ctl);
             drop(bottles);
@@ -551,13 +673,7 @@ fn load_project(app: AppHandle, milk: State<Milk>, path: String) -> Result<Bottl
 
     let id = milk.next.fetch_add(1, Ordering::SeqCst);
     let name = dir_name(&root);
-    let ctl = Ctl {
-        path: root.clone(),
-        name: name.clone(),
-        cancel: Arc::new(AtomicBool::new(false)),
-        brew: Arc::new(Mutex::new(None)),
-        icebox: Arc::new(Mutex::new(None)),
-    };
+    let ctl = Ctl::new(root.clone(), name.clone());
     milk.bottles.lock().unwrap().insert(id, ctl);
     spawn_route(&app, &milk, id);
     Ok(BottleInfo {
@@ -567,6 +683,10 @@ fn load_project(app: AppHandle, milk: State<Milk>, path: String) -> Result<Bottl
         state: "inspecting".into(),
         stack: None,
         glyph: None,
+        manager: None,
+        framework: None,
+        last_url: None,
+        restored: false,
     })
 }
 
@@ -583,10 +703,19 @@ fn stop_bottle(app: AppHandle, milk: State<Milk>, id: u32) {
 }
 
 #[tauri::command]
-fn rerun_bottle(app: AppHandle, milk: State<Milk>, id: u32) {
+fn rerun_bottle(
+    app: AppHandle,
+    milk: State<Milk>,
+    id: u32,
+    port: Option<u16>,
+    script: Option<String>,
+) {
     {
         let bottles = milk.bottles.lock().unwrap();
         if let Some(ctl) = bottles.get(&id) {
+            // every explicit pour replaces the whole override set — a plain
+            // `pour` returns to defaults
+            *ctl.overrides.lock().unwrap() = RouteOverrides { port, script };
             cap_bottle(ctl);
         }
     }
@@ -598,6 +727,8 @@ fn remove_bottle(milk: State<Milk>, id: u32) {
     let mut bottles = milk.bottles.lock().unwrap();
     if let Some(ctl) = bottles.remove(&id) {
         cap_bottle(&ctl);
+        milk.logs.lock().unwrap().remove(&id);
+        let _ = std::fs::remove_file(milk.log_path(&ctl.path));
         let mut led = milk.ledger.lock().unwrap();
         led.remove(&ctl.path);
         led.save(&milk.ledger_file);
@@ -617,26 +748,128 @@ fn restore_crate(milk: State<Milk>) -> Vec<BottleInfo> {
             continue;
         }
         let id = milk.next.fetch_add(1, Ordering::SeqCst);
-        bottles.insert(
-            id,
-            Ctl {
-                path: entry.path.clone(),
-                name: entry.name.clone(),
-                cancel: Arc::new(AtomicBool::new(false)),
-                brew: Arc::new(Mutex::new(None)),
-                icebox: Arc::new(Mutex::new(None)),
-            },
-        );
+        bottles.insert(id, Ctl::new(entry.path.clone(), entry.name.clone()));
         out.push(BottleInfo {
             id,
             name: entry.name,
             path: entry.path.to_string_lossy().into_owned(),
             state: "capped".into(),
+            glyph: Some(glyph_for(&entry.stack).into()),
             stack: Some(entry.stack),
-            glyph: None,
+            manager: Some(entry.manager),
+            framework: entry.framework,
+            last_url: entry.last_url,
+            restored: true,
         });
     }
     out
+}
+
+// ------------------------------------------------------------ cli commands
+
+/// Replay a bottle's persisted last log (lines only, capped).
+#[tauri::command]
+fn bottle_log(milk: State<Milk>, id: u32) -> Vec<LogLine> {
+    let path = {
+        let bottles = milk.bottles.lock().unwrap();
+        let Some(ctl) = bottles.get(&id) else { return vec![] };
+        milk.log_path(&ctl.path)
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else { return vec![] };
+    let mut lines: Vec<LogLine> = text
+        .lines()
+        .map(|l| {
+            let (kind, text) = l.split_once('\t').unwrap_or(("raw", l));
+            LogLine { kind: kind.into(), text: text.into() }
+        })
+        .collect();
+    let cap = 2000;
+    if lines.len() > cap {
+        lines.drain(..lines.len() - cap);
+    }
+    lines
+}
+
+/// CLI `env` — create .env from .env.example so CHILL stops warning.
+#[tauri::command]
+fn bootstrap_env(milk: State<Milk>, id: u32) -> Result<String, String> {
+    let root = {
+        let bottles = milk.bottles.lock().unwrap();
+        let Some(ctl) = bottles.get(&id) else { return Err("no such bottle".into()) };
+        ctl.path.clone()
+    };
+    if root.join(".env").exists() {
+        return Err("a .env already exists \u{2500} nothing to do".into());
+    }
+    for cand in [".env.example", ".env.sample"] {
+        let src = root.join(cand);
+        if src.exists() {
+            std::fs::copy(&src, root.join(".env")).map_err(|e| e.to_string())?;
+            return Ok(format!(".env created from {cand}"));
+        }
+    }
+    Err("no .env.example or .env.sample in this package".into())
+}
+
+/// CLI `watch` — re-pour the bottle whenever files in the package change.
+#[tauri::command]
+fn watch_bottle(app: AppHandle, milk: State<Milk>, id: u32, on: bool) -> Result<(), String> {
+    use notify::Watcher;
+
+    let bottles = milk.bottles.lock().unwrap();
+    let Some(ctl) = bottles.get(&id) else { return Err("no such bottle".into()) };
+
+    if !on {
+        let had = ctl.watcher.lock().unwrap().take().is_some();
+        drop(bottles);
+        if had {
+            emit_line(&app, id, "note", " watch off");
+        }
+        return Ok(());
+    }
+
+    let (tx, rx) = mpsc::channel::<()>();
+    let mut watcher = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+        if let Ok(ev) = res {
+            // ignore churn from installs, builds, and VCS internals
+            const NOISE: [&str; 6] = ["node_modules", ".git", "dist", "build", "target", ".venv"];
+            let relevant = ev.paths.iter().any(|p| {
+                let s = p.to_string_lossy().replace('\\', "/");
+                !NOISE
+                    .iter()
+                    .any(|n| s.contains(&format!("/{n}/")) || s.ends_with(&format!("/{n}")))
+            });
+            if relevant {
+                let _ = tx.send(());
+            }
+        }
+    })
+    .map_err(|e| e.to_string())?;
+    watcher
+        .watch(&ctl.path, notify::RecursiveMode::Recursive)
+        .map_err(|e| e.to_string())?;
+    *ctl.watcher.lock().unwrap() = Some(watcher);
+    drop(bottles);
+    emit_line(&app, id, "note", " watch on \u{2500} the route re-pours when package files change");
+
+    let app2 = app.clone();
+    std::thread::spawn(move || {
+        // the sender lives inside the watcher; when the watcher is dropped
+        // (watch off / bottle removed) recv fails and this thread ends
+        while rx.recv().is_ok() {
+            // debounce: wait for 700ms of quiet
+            while rx.recv_timeout(Duration::from_millis(700)).is_ok() {}
+            let milk = app2.state::<Milk>();
+            {
+                let bottles = milk.bottles.lock().unwrap();
+                let Some(ctl) = bottles.get(&id) else { break };
+                cap_bottle(ctl);
+            }
+            emit_line(&app2, id, "note", " \u{21ba} change detected \u{2500} re-pouring");
+            spawn_route(&app2, &milk, id);
+        }
+    });
+    Ok(())
 }
 
 #[cfg(test)]
@@ -655,6 +888,7 @@ mod tests {
             port_steer: resolver::PortSteer::ScriptFlag("--port"),
             confidence: resolver::Confidence::Exact,
             warnings: vec![],
+            scripts: vec![],
             hash_source: None,
             artifact_dir: None,
         };
@@ -689,7 +923,10 @@ pub fn run() {
             stop_bottle,
             rerun_bottle,
             remove_bottle,
-            restore_crate
+            restore_crate,
+            bottle_log,
+            bootstrap_env,
+            watch_bottle
         ])
         .run(tauri::generate_context!())
         .expect("error while running MILKMAN");

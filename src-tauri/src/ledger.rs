@@ -15,6 +15,9 @@ pub struct Entry {
     pub stack: String,
     pub manager: String,
     pub framework: Option<String>,
+    /// where the last successful delivery was served
+    #[serde(default)]
+    pub last_url: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -51,6 +54,17 @@ impl Ledger {
     pub fn remove(&mut self, path: &Path) {
         self.entries.retain(|e| e.path != path);
     }
+
+    /// Record the delivered URL for a package. Returns true if changed.
+    pub fn set_url(&mut self, path: &Path, url: &str) -> bool {
+        if let Some(e) = self.entries.iter_mut().find(|e| e.path == path) {
+            if e.last_url.as_deref() != Some(url) {
+                e.last_url = Some(url.to_string());
+                return true;
+            }
+        }
+        false
+    }
 }
 
 pub fn hash_file(path: &Path) -> Option<String> {
@@ -58,4 +72,11 @@ pub fn hash_file(path: &Path) -> Option<String> {
     let mut h = Sha256::new();
     h.update(&bytes);
     Some(format!("{:x}", h.finalize()))
+}
+
+/// Short stable key for a string (log file names keyed by package path).
+pub fn hash_str(s: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(s.as_bytes());
+    format!("{:x}", h.finalize())[..16].to_string()
 }

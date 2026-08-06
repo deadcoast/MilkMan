@@ -18,7 +18,8 @@ export type LineKind =
   | "raw"
   | "url"
   | "fold"
-  | "sig";
+  | "sig"
+  | "cmd";
 
 export interface Line {
   kind: LineKind;
@@ -31,6 +32,8 @@ export interface Profile {
   manager: string;
   framework: string | null;
   confidence: string;
+  /** package.json script names (node family only) */
+  scripts: string[];
 }
 
 export interface BottleView {
@@ -47,6 +50,12 @@ export interface BottleView {
   foldedCount: number;
   startedAt: number;
   deliveredAt: number | null;
+  /** true for bottles brought back from the ledger, until re-poured */
+  restored: boolean;
+  /** where the previous delivery was served (from the ledger) */
+  lastUrl: string | null;
+  /** last-log replay already fetched (guards the lazy load) */
+  historyLoaded: boolean;
 }
 
 export interface LinePayload {
@@ -71,4 +80,13 @@ export interface BottleInfo {
   state: BottleState;
   stack: string | null;
   glyph: string | null;
+  manager: string | null;
+  framework: string | null;
+  last_url: string | null;
+  restored: boolean;
+}
+
+export interface LogLine {
+  kind: string;
+  text: string;
 }

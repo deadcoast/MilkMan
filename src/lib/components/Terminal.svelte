@@ -1,6 +1,7 @@
 <script lang="ts">
   import { crate } from "../bottles.svelte";
-  import { stopBottle } from "../ipc";
+  import { loadHistory, stopBottle } from "../ipc";
+  import Prompt from "./Prompt.svelte";
   import type { Line } from "../types";
 
   const FRAMES = ["\u2500", "\\", "\u2502", "/"];
@@ -18,6 +19,23 @@
     bottle !== null &&
       ["inspecting", "bottling", "chilling", "delivering"].includes(bottle.state)
   );
+  const resting = $derived(
+    bottle !== null && !running && bottle.lines.length === 0
+  );
+
+  // a restored bottle replays its persisted last log into scrollback (L)
+  $effect(() => {
+    const b = crate.active;
+    if (b && b.restored && !b.historyLoaded) {
+      void loadHistory(b);
+    }
+  });
+
+  function badges(): string {
+    const p = bottle?.profile;
+    if (!p) return "an unopened delivery";
+    return [p.stack, p.manager, p.framework].filter(Boolean).join(" \u00b7 ");
+  }
 
   // autoscroll on new lines
   $effect(() => {
@@ -82,6 +100,23 @@
       {#each bottle.rawLog as text}
         <div class="ln raw">{text}</div>
       {/each}
+    {:else if resting}
+      <div class="empty resting">
+        <pre class="bottle-art">{`      ____
+     |    |
+     |____|
+    /      \\
+   |  MILK  |
+   |        |
+   |________|`}</pre>
+        <p class="rest-name">{bottle.name}</p>
+        <p class="rest-badges">{badges()}</p>
+        <p class="rest-path" title={bottle.path}>{bottle.path}</p>
+        {#if bottle.lastUrl}
+          <p class="rest-url">last delivery &#9472; {bottle.lastUrl}</p>
+        {/if}
+        <p class="empty-sub">press R or type pour to deliver &#183; L for the last log</p>
+      </div>
     {:else}
       {#each bottle.lines as line}
         <div class={classFor(line)}>{line.text}{spin(line)}</div>
@@ -94,6 +129,10 @@
 
   <div class="scanlines" aria-hidden="true"></div>
   </div>
+
+  {#if bottle}
+    <Prompt />
+  {/if}
 </div>
 
 <style>
@@ -102,23 +141,30 @@
   .terminal {
     position: relative;
     height: 100%;
+    display: flex;
+    flex-direction: column;
   }
 
   .frame {
     position: relative;
-    height: 100%;
+    flex: 1;
+    min-height: 0;
     background: var(--void);
     border: 4px double var(--line);
     overflow: hidden;
   }
 
+  /* the title and cancel tabs float above the scrolling output: a padded
+     underline plus a drop shadow separate them from the log beneath */
   .title {
     position: absolute;
     top: 0;
     left: 18px;
     transform: translateY(-50%);
     background: var(--chrome);
-    padding: 0 6px;
+    padding: 4px 8px 5px;
+    border-bottom: 1px solid var(--line);
+    box-shadow: 0 5px 14px rgba(0, 0, 0, 0.65);
     font-family: var(--mono);
     font-size: var(--cell);
     color: var(--cream);
@@ -137,7 +183,9 @@
     transform: translateY(-50%);
     background: var(--chrome);
     border: none;
-    padding: 0 6px;
+    padding: 4px 8px 5px;
+    border-bottom: 1px solid var(--line);
+    box-shadow: 0 5px 14px rgba(0, 0, 0, 0.65);
     font-family: var(--mono);
     font-weight: 400;
     font-size: var(--cell);
@@ -149,6 +197,7 @@
   }
   .cancel:hover {
     color: var(--cream);
+    border-bottom-color: var(--cream);
   }
 
   .screen {
@@ -196,6 +245,10 @@
   .ln.sig {
     color: var(--spoiled);
   }
+  .ln.cmd {
+    color: var(--cream);
+    margin-top: 4px;
+  }
   .ln.fold {
     color: var(--skim);
     border-top: 1px solid var(--line);
@@ -242,6 +295,33 @@
   }
   .empty-sub {
     color: var(--skim);
+    font-family: var(--mono);
+    font-size: var(--cell);
+  }
+
+  /* a capped bottle at rest — the void, furnished */
+  .rest-name {
+    color: var(--cream);
+    font-family: var(--mono);
+    font-size: calc(var(--cell) + 2px);
+    letter-spacing: 0.2em;
+  }
+  .rest-badges {
+    color: var(--butter);
+    font-family: var(--mono);
+    font-size: var(--cell);
+  }
+  .rest-path {
+    color: var(--skim);
+    font-family: var(--mono);
+    font-size: calc(var(--cell) - 2px);
+    max-width: 80%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .rest-url {
+    color: var(--cold);
     font-family: var(--mono);
     font-size: var(--cell);
   }

@@ -4,7 +4,10 @@
 
   const bottle = $derived(crate.active);
   const show = $derived(
-    bottle !== null && (bottle.state === "fresh" || bottle.state === "spoiled")
+    bottle !== null &&
+      (bottle.state === "fresh" ||
+        bottle.state === "spoiled" ||
+        bottle.state === "capped")
   );
 </script>
 
@@ -17,9 +20,13 @@
         <button class="cold" onclick={() => bottle.url && open(bottle.url)}>OPEN</button>
       {/if}
       <button onclick={() => stopBottle(bottle.id)}>STOP</button>
-    {:else}
+    {:else if bottle.state === "spoiled"}
       <span class="mark bad">&#9679; SPOILED</span>
       <span class="url">route failed &#9472; details above</span>
+      <button onclick={() => rerunBottle(bottle.id)}>RE-POUR</button>
+    {:else}
+      <span class="mark capped">&#9679; CAPPED</span>
+      <span class="url dim">route stopped &#9472; R re-pours</span>
       <button onclick={() => rerunBottle(bottle.id)}>RE-POUR</button>
     {/if}
   </aside>
@@ -30,7 +37,7 @@
     position: absolute;
     left: 20px;
     right: 20px;
-    bottom: 12px;
+    bottom: 48px; /* clears the prompt bar */
     background: var(--raised);
     border: 1px solid var(--line);
     display: flex;
@@ -53,6 +60,12 @@
   }
   .mark.bad {
     color: var(--spoiled);
+  }
+  .mark.capped {
+    color: var(--skim);
+  }
+  .url.dim {
+    color: var(--skim);
   }
   .url {
     flex: 1;

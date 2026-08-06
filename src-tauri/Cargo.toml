@@ -24,6 +24,7 @@ once_cell = "1"
 sha2 = "0.10"
 which = "7"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+notify = "8"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

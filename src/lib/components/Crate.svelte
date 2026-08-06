@@ -1,6 +1,6 @@
 <script lang="ts">
   import { crate } from "../bottles.svelte";
-  import { pickPackage, removeBottle, rerunBottle } from "../ipc";
+  import { pickPackage, removeBottle } from "../ipc";
   import type { BottleView } from "../types";
 
   let addOpen = $state(false);
@@ -23,10 +23,9 @@
     }
   }
 
+  // selecting selects — re-pouring is explicit (RE-POUR button, R, `pour`)
   function pick(b: BottleView) {
     crate.activeId = b.id;
-    // waking a capped bottle re-runs its route
-    if (b.state === "capped") void rerunBottle(b.id);
   }
 
   function drop(e: MouseEvent, b: BottleView) {
@@ -37,7 +36,14 @@
 </script>
 
 <nav class="crate" aria-label="crate">
-  <div class="brand" title="MILKMAN">M</div>
+  <button
+    class="brand"
+    title="about the milkman"
+    onclick={(e) => {
+      e.stopPropagation();
+      crate.showSettings = !crate.showSettings;
+    }}
+  >M</button>
   {#each crate.list as b (b.id)}
     <button
       class="slot {ringClass(b)}"
@@ -96,14 +102,22 @@
 
   .brand {
     font-family: var(--mono);
+    font-weight: 400;
     font-size: 18px;
+    letter-spacing: normal;
     color: var(--cream);
+    background: transparent;
     border: 1px solid var(--line);
     width: 48px;
     height: 30px;
+    padding: 0;
     display: grid;
     place-items: center;
     margin-bottom: 4px;
+    cursor: pointer;
+  }
+  .brand:hover {
+    border-color: var(--cream);
   }
 
   .slot {

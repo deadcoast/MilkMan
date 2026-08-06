@@ -4,6 +4,7 @@ import type {
   BottleInfo,
   BottleState,
   BottleView,
+  LineKind,
   LinePayload,
   StatePayload,
 } from "./types";
@@ -15,6 +16,9 @@ class Crate {
   bottles = $state<Record<number, BottleView>>({});
   activeId = $state<number | null>(null);
   showFullRaw = $state(false);
+  showSettings = $state(false);
+  /** bottles that should open in the browser on their next FRESH */
+  autoOpen: Record<number, boolean> = {};
 
   get active(): BottleView | null {
     return this.activeId !== null ? (this.bottles[this.activeId] ?? null) : null;
@@ -34,10 +38,11 @@ class Crate {
         profile: info.stack
           ? {
               stack: info.stack,
-              glyph: info.stack.slice(0, 2),
-              manager: "",
-              framework: null,
+              glyph: info.glyph ?? info.stack.slice(0, 2),
+              manager: info.manager ?? "",
+              framework: info.framework ?? null,
               confidence: "",
+              scripts: [],
             }
           : null,
         url: null,
@@ -47,6 +52,9 @@ class Crate {
         foldedCount: 0,
         startedAt: Date.now(),
         deliveredAt: null,
+        restored: info.restored ?? false,
+        lastUrl: info.last_url ?? null,
+        historyLoaded: false,
       };
     } else {
       // re-drop: reset the route
@@ -59,6 +67,7 @@ class Crate {
       b.port = null;
       b.startedAt = Date.now();
       b.deliveredAt = null;
+      b.restored = false;
     }
     if (activate) this.activeId = info.id;
   }
@@ -123,14 +132,28 @@ class Crate {
     if (!b) return;
     b.state = p.state;
     if (p.profile) b.profile = p.profile;
-    if (p.url) b.url = p.url;
+    if (p.url) {
+      b.url = p.url;
+      b.lastUrl = p.url;
+    }
     if (p.port) b.port = p.port;
     if (p.state === "fresh" && !b.deliveredAt) b.deliveredAt = Date.now();
     if (p.state === "inspecting") {
+      // a fresh pour begins: reset the route view (the raw scrollback and
+      // persisted last-log survive via L)
+      b.lines = [];
+      b.foldedCount = 0;
       b.url = null;
       b.port = null;
       b.deliveredAt = null;
+      b.startedAt = Date.now();
+      b.restored = false;
     }
+  }
+
+  /** CLI feedback and echoes land in the terminal like any other line. */
+  say(id: number, kind: LineKind, text: string) {
+    this.onLine({ bottle: id, kind, text, rewrite: false });
   }
 }
 
