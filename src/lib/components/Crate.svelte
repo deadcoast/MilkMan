@@ -1,7 +1,14 @@
 <script lang="ts">
   import { crate } from "../bottles.svelte";
-  import { removeBottle, rerunBottle } from "../ipc";
+  import { pickPackage, removeBottle, rerunBottle } from "../ipc";
   import type { BottleView } from "../types";
+
+  let addOpen = $state(false);
+
+  async function addFrom(kind: "folder" | "zip") {
+    addOpen = false;
+    await pickPackage(kind);
+  }
 
   function ringClass(b: BottleView): string {
     switch (b.state) {
@@ -50,8 +57,29 @@
       >&times;</span>
     </button>
   {/each}
-  <div class="hint" aria-hidden="true">+<span class="hint-text">drag a package anywhere</span></div>
+  <div class="add-wrap">
+    <button
+      class="add"
+      class:open={addOpen}
+      onclick={(e) => {
+        e.stopPropagation();
+        addOpen = !addOpen;
+      }}
+      title="add a package — or drag one anywhere"
+      aria-label="add a package"
+      aria-expanded={addOpen}
+    >+</button>
+    {#if addOpen}
+      <div class="menu" role="menu">
+        <button role="menuitem" onclick={() => addFrom("folder")}>FOLDER&#8230;</button>
+        <button role="menuitem" onclick={() => addFrom("zip")}>.ZIP&#8230;</button>
+        <span class="menu-hint">or drag a package anywhere</span>
+      </div>
+    {/if}
+  </div>
 </nav>
+
+<svelte:window onclick={() => (addOpen = false)} />
 
 <style>
   .crate {
@@ -150,32 +178,47 @@
     color: var(--spoiled);
   }
 
-  .hint {
-    color: var(--line);
+  .add-wrap {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+  }
+  .add {
+    color: var(--skim);
     font-family: var(--mono);
     font-size: 16px;
     width: 48px;
     height: 48px;
+    padding: 0;
+    background: transparent;
     border: 1px dashed var(--line);
     display: grid;
     place-items: center;
-    position: relative;
+    cursor: pointer;
   }
-  .hint-text {
-    display: none;
+  .add:hover,
+  .add.open {
+    color: var(--cream);
   }
-  .hint:hover .hint-text {
-    display: block;
-    position: absolute;
-    left: 56px;
-    top: 50%;
-    transform: translateY(-50%);
-    background: var(--raised);
-    border: 1px solid var(--line);
-    color: var(--skim);
+  .menu {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    width: 60px;
+  }
+  .menu button {
+    width: 100%;
+    padding: 5px 0;
+    font-family: var(--mono);
     font-size: 9px;
-    padding: 4px 8px;
-    white-space: nowrap;
-    z-index: 5;
+    letter-spacing: 0.06em;
+  }
+  .menu-hint {
+    color: var(--skim);
+    font-family: var(--mono);
+    font-size: 8px;
+    line-height: 1.5;
+    text-align: center;
   }
 </style>

@@ -148,6 +148,32 @@ fn dir_name(path: &Path) -> String {
         .unwrap_or_else(|| "package".into())
 }
 
+// ---------------------------------------------------------------- ports
+
+/// Ports worth trying when a package's own choice is taken.
+const COMMON_PORTS: &[u16] = &[
+    3000, 3001, 4000, 4173, 4321, 5000, 5173, 5174, 8000, 8080, 8081, 8888,
+];
+
+/// How many times DELIVER re-pours onto another port before giving up.
+const MAX_REPOURS: usize = 4;
+
+/// Pick the first common port that is currently free and untried, and
+/// rebuild the run command pinned to it. None when the stack can't be
+/// steered or every candidate is busy.
+fn steer_to_free_port(
+    profile: &resolver::StackProfile,
+    tried: &[u16],
+) -> Option<(Vec<String>, Vec<(String, String)>, u16)> {
+    let port = COMMON_PORTS
+        .iter()
+        .copied()
+        .filter(|p| !tried.contains(p))
+        .find(|p| TcpListener::bind(("127.0.0.1", *p)).is_ok())?;
+    let (cmd, env) = profile.run_with_port(port)?;
+    Some((cmd, env, port))
+}
+
 // ---------------------------------------------------------------- zip intake
 
 fn unpack_zip(zip_path: &Path, workspace: &Path) -> Result<PathBuf, String> {
@@ -261,37 +287,17 @@ fn run_route(
         }
         Some(cmd) => {
             emit_line(&app, id, "note", format!(" $ {}", cmd.join(" ")));
-            match dairy::tap(cmd, &root) {
+            let poured = dairy::serve(cmd, &root, &[], &brew_slot, &cancel, |c| match c {
+                Chunk::Line(t) => emit_line(&app, id, "raw", t),
+                Chunk::Rewrite(t) => emit_rewrite(&app, id, t),
+            });
+            match poured {
                 Err(e) => {
                     emit_line(&app, id, "err", format!("SPOILED \u{2500} could not start install: {e}"));
                     emit_state(&app, id, "spoiled", None, None, Some(profile_view(&profile)));
                     return;
                 }
-                Ok((brew, mut reader)) => {
-                    *brew_slot.lock().unwrap() = Some(brew);
-                    let mut churn = dairy::Churn::new();
-                    let mut buf = [0u8; 4096];
-                    loop {
-                        match std::io::Read::read(&mut reader, &mut buf) {
-                            Ok(0) => break,
-                            Ok(n) => churn.feed(&buf[..n], |c| match c {
-                                Chunk::Line(t) => emit_line(&app, id, "raw", t),
-                                Chunk::Rewrite(t) => emit_rewrite(&app, id, t),
-                            }),
-                            Err(_) => break,
-                        }
-                    }
-                    churn.flush(|c| {
-                        if let Chunk::Line(t) = c {
-                            emit_line(&app, id, "raw", t)
-                        }
-                    });
-                    let code = {
-                        let mut slot = brew_slot.lock().unwrap();
-                        let code = slot.as_mut().map(|b| b.wait()).unwrap_or(1);
-                        *slot = None;
-                        code
-                    };
+                Ok(code) => {
                     if canceled() {
                         return;
                     }
@@ -366,73 +372,119 @@ fn run_route(
         return;
     }
 
-    emit_line(&app, id, "note", format!(" $ {}", profile.run_cmd.join(" ")));
-    let (brew, mut reader) = match dairy::tap(&profile.run_cmd, &root) {
-        Ok(pair) => pair,
-        Err(e) => {
-            emit_line(&app, id, "err", format!("SPOILED \u{2500} could not start: {e}"));
+    let mut run_cmd = profile.run_cmd.clone();
+    let mut run_env: Vec<(String, String)> = Vec::new();
+    let mut tried_ports: Vec<u16> = Vec::new();
+    let mut repours = 0usize;
+
+    // if the stack's own port is already visibly taken, don't bother
+    // crashing into it — steer to a free one up front
+    if let Some(dp) = profile.default_port {
+        if TcpListener::bind(("127.0.0.1", dp)).is_err() {
+            tried_ports.push(dp);
+            if let Some((cmd, env, port)) = steer_to_free_port(&profile, &tried_ports) {
+                emit_line(
+                    &app,
+                    id,
+                    "warn",
+                    format!(" ! port {dp} taken \u{2500} pouring on {port} instead"),
+                );
+                tried_ports.push(port);
+                run_cmd = cmd;
+                run_env = env;
+            }
+        }
+    }
+
+    loop {
+        emit_line(&app, id, "note", format!(" $ {}", run_cmd.join(" ")));
+        let mut delivered = false;
+        // Some(named_port) once the child complains its port is occupied
+        let mut clash: Option<Option<u16>> = None;
+        let served = dairy::serve(&run_cmd, &root, &run_env, &brew_slot, &cancel, |c| {
+            // the doorstep address can arrive on a finished line or inside
+            // a progress-rewritten one — sniff both
+            let text = match &c {
+                Chunk::Line(t) | Chunk::Rewrite(t) => t,
+            };
+            let found = if delivered { None } else { porter::sniff(text) };
+            if !delivered && clash.is_none() && porter::is_port_clash(text) {
+                clash = Some(porter::clash_port(text));
+            }
+            match c {
+                Chunk::Line(t) => emit_line(&app, id, "raw", t),
+                Chunk::Rewrite(t) => emit_rewrite(&app, id, t),
+            }
+            if let Some(url) = found {
+                delivered = true;
+                let port = url.rsplit(':').next().and_then(|p| {
+                    p.chars()
+                        .take_while(|c| c.is_ascii_digit())
+                        .collect::<String>()
+                        .parse::<u16>()
+                        .ok()
+                });
+                emit_line(&app, id, "url", format!(" \u{25cf} FRESH \u{2500} {url}"));
+                emit_state(&app, id, "fresh", Some(url), port, Some(profile_view(&profile)));
+            }
+        });
+        let code = match served {
+            Ok(code) => code,
+            Err(e) => {
+                emit_line(&app, id, "err", format!("SPOILED \u{2500} could not start: {e}"));
+                emit_state(&app, id, "spoiled", None, None, Some(profile_view(&profile)));
+                return;
+            }
+        };
+
+        if canceled() {
+            emit_line(&app, id, "note", " \u{2500}\u{2500} capped \u{2500}\u{2500}");
+            return; // stop_bottle already emitted the capped state
+        }
+        if delivered {
+            emit_line(&app, id, "note", format!(" process ended (exit {code})"));
+            emit_state(&app, id, "capped", None, None, Some(profile_view(&profile)));
+            return;
+        }
+        if code != 0 {
+            if let Some(named_port) = clash {
+                // the doorstep was occupied — try the next free common port
+                if let Some(p) = named_port {
+                    if !tried_ports.contains(&p) {
+                        tried_ports.push(p);
+                    }
+                }
+                if repours < MAX_REPOURS {
+                    if let Some((cmd, env, port)) = steer_to_free_port(&profile, &tried_ports) {
+                        repours += 1;
+                        emit_line(
+                            &app,
+                            id,
+                            "warn",
+                            format!(
+                                " ! port taken \u{2500} re-pouring on {port} ({repours}/{MAX_REPOURS})"
+                            ),
+                        );
+                        tried_ports.push(port);
+                        run_cmd = cmd;
+                        run_env = env;
+                        continue;
+                    }
+                }
+                emit_line(
+                    &app,
+                    id,
+                    "warn",
+                    " ! every port MILKMAN tried is taken (or this stack's port can't be moved) \u{2500} free one up, then RE-POUR",
+                );
+            }
+            emit_line(&app, id, "err", format!("SPOILED \u{2500} exited with code {code} before serving"));
             emit_state(&app, id, "spoiled", None, None, Some(profile_view(&profile)));
             return;
         }
-    };
-    *brew_slot.lock().unwrap() = Some(brew);
-
-    let mut delivered = false;
-    let mut churn = dairy::Churn::new();
-    let mut buf = [0u8; 4096];
-    loop {
-        match std::io::Read::read(&mut reader, &mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                let mut found: Option<String> = None;
-                churn.feed(&buf[..n], |c| match c {
-                    Chunk::Line(t) => {
-                        if !delivered {
-                            if let Some(url) = porter::sniff(&t) {
-                                found.get_or_insert(url);
-                            }
-                        }
-                        emit_line(&app, id, "raw", t);
-                    }
-                    Chunk::Rewrite(t) => emit_rewrite(&app, id, t),
-                });
-                if let (false, Some(url)) = (delivered, found) {
-                    delivered = true;
-                    let port = url.rsplit(':').next().and_then(|p| {
-                        p.chars()
-                            .take_while(|c| c.is_ascii_digit())
-                            .collect::<String>()
-                            .parse::<u16>()
-                            .ok()
-                    });
-                    emit_line(&app, id, "url", format!(" \u{25cf} FRESH \u{2500} {url}"));
-                    emit_state(&app, id, "fresh", Some(url), port, Some(profile_view(&profile)));
-                }
-            }
-            Err(_) => break,
-        }
-    }
-
-    let code = {
-        let mut slot = brew_slot.lock().unwrap();
-        let code = slot.as_mut().map(|b| b.wait()).unwrap_or(0);
-        *slot = None;
-        code
-    };
-
-    if canceled() {
-        emit_line(&app, id, "note", " \u{2500}\u{2500} capped \u{2500}\u{2500}");
-        return; // stop_bottle already emitted the capped state
-    }
-    if delivered {
-        emit_line(&app, id, "note", format!(" process ended (exit {code})"));
-        emit_state(&app, id, "capped", None, None, Some(profile_view(&profile)));
-    } else if code != 0 {
-        emit_line(&app, id, "err", format!("SPOILED \u{2500} exited with code {code} before serving"));
-        emit_state(&app, id, "spoiled", None, None, Some(profile_view(&profile)));
-    } else {
         emit_line(&app, id, "note", " process finished without serving a URL");
         emit_state(&app, id, "capped", None, None, Some(profile_view(&profile)));
+        return;
     }
 }
 
@@ -522,6 +574,9 @@ fn load_project(app: AppHandle, milk: State<Milk>, path: String) -> Result<Bottl
 fn stop_bottle(app: AppHandle, milk: State<Milk>, id: u32) {
     let bottles = milk.bottles.lock().unwrap();
     if let Some(ctl) = bottles.get(&id) {
+        // acknowledge the interrupt in the terminal, terminal-style, so
+        // users learn ctrl+c is the cancel hotkey
+        emit_line(&app, id, "sig", "^C");
         cap_bottle(ctl);
         emit_state(&app, id, "capped", None, None, None);
     }
@@ -584,12 +639,43 @@ fn restore_crate(milk: State<Milk>) -> Vec<BottleInfo> {
     out
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn steering_skips_tried_common_ports() {
+        let profile = resolver::StackProfile {
+            stack: resolver::Stack::Node,
+            manager: "npm".into(),
+            framework: Some("vite".into()),
+            install_cmd: None,
+            run_cmd: vec!["npm".into(), "run".into(), "dev".into()],
+            default_port: Some(5173),
+            port_steer: resolver::PortSteer::ScriptFlag("--port"),
+            confidence: resolver::Confidence::Exact,
+            warnings: vec![],
+            hash_source: None,
+            artifact_dir: None,
+        };
+        let tried = vec![COMMON_PORTS[0], COMMON_PORTS[1]];
+        let (cmd, env, port) = steer_to_free_port(&profile, &tried).expect("a free common port");
+        assert!(!tried.contains(&port), "picked an already-tried port {port}");
+        assert!(
+            cmd.ends_with(&["--".into(), "--port".into(), port.to_string()]),
+            "unexpected steered cmd: {cmd:?}"
+        );
+        assert!(env.is_empty());
+    }
+}
+
 // ---------------------------------------------------------------- entry
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let data_dir = app
                 .path()

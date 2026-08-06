@@ -3,6 +3,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { crate } from "./bottles.svelte";
 import type { BottleInfo, LinePayload, StatePayload } from "./types";
@@ -24,6 +25,21 @@ export async function loadProject(path: string): Promise<void> {
     }
     console.error("load_project:", e);
   }
+}
+
+/** The [+] button: browse for a package (folder or .zip) and bottle it. */
+export async function pickPackage(kind: "folder" | "zip"): Promise<void> {
+  const path =
+    kind === "folder"
+      ? await openDialog({
+          directory: true,
+          title: "MILKMAN ─ choose a package folder",
+        })
+      : await openDialog({
+          filters: [{ name: "package archive", extensions: ["zip"] }],
+          title: "MILKMAN ─ choose a package .zip",
+        });
+  if (typeof path === "string") await loadProject(path);
 }
 
 export const stopBottle = (id: number) => invoke("stop_bottle", { id });

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { crate } from "./lib/bottles.svelte";
-  import { wire } from "./lib/ipc";
+  import { stopBottle, wire } from "./lib/ipc";
   import Crate from "./lib/components/Crate.svelte";
   import Terminal from "./lib/components/Terminal.svelte";
   import StatusStrip from "./lib/components/StatusStrip.svelte";
@@ -13,7 +13,18 @@
   onMount(() => {
     void wire((over) => (dragOver = over));
 
+    const INTERRUPTIBLE = ["inspecting", "bottling", "chilling", "delivering", "fresh"];
     const onKey = (e: KeyboardEvent) => {
+      // ctrl+c interrupts the active route — unless the user is copying text
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "c") {
+        const b = crate.active;
+        const copying = (window.getSelection()?.toString() ?? "") !== "";
+        if (b && !copying && INTERRUPTIBLE.includes(b.state)) {
+          e.preventDefault();
+          void stopBottle(b.id);
+        }
+        return;
+      }
       if (e.key.toLowerCase() === "l" && crate.active) {
         crate.showFullRaw = !crate.showFullRaw;
       }

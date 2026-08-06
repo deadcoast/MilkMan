@@ -55,6 +55,24 @@ impl Confidence {
     }
 }
 
+/// How a stack's dev server can be moved to a different port when its
+/// preferred one is taken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum PortSteer {
+    /// no reliable way to choose the port — don't retry
+    Fixed,
+    /// append `-- <flag> <port>` to the manager script invocation
+    /// (vite/astro/sveltekit/nuxt `--port`, next `-p`)
+    ScriptFlag(&'static str),
+    /// append `<flag> <port>` directly to the run command
+    /// (uvicorn/flask `--port`, sinatra `-p`)
+    ArgFlag(&'static str),
+    /// append `127.0.0.1:<port>` (django runserver)
+    BindAddr,
+    /// set `PORT=<port>` in the environment (CRA, generic node, go)
+    PortEnv,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct StackProfile {
     pub stack: Stack,
@@ -65,12 +83,43 @@ pub struct StackProfile {
     /// Empty = MILKMAN's built-in static server
     pub run_cmd: Vec<String>,
     pub default_port: Option<u16>,
+    pub port_steer: PortSteer,
     pub confidence: Confidence,
     pub warnings: Vec<String>,
     /// file whose hash decides whether BOTTLE can be skipped on re-runs
     pub hash_source: Option<PathBuf>,
     /// directory whose presence means deps are already installed
     pub artifact_dir: Option<&'static str>,
+}
+
+impl StackProfile {
+    /// Rebuild the run command (and any extra env) pinned to `port`.
+    /// None when this stack cannot be steered to another port.
+    pub fn run_with_port(&self, port: u16) -> Option<(Vec<String>, Vec<(String, String)>)> {
+        if self.run_cmd.is_empty() {
+            return None; // built-in static server picks its own free port
+        }
+        let p = port.to_string();
+        match self.port_steer {
+            PortSteer::Fixed => None,
+            PortSteer::ScriptFlag(flag) => {
+                let mut cmd = self.run_cmd.clone();
+                cmd.extend(["--".into(), flag.into(), p]);
+                Some((cmd, vec![]))
+            }
+            PortSteer::ArgFlag(flag) => {
+                let mut cmd = self.run_cmd.clone();
+                cmd.extend([flag.into(), p]);
+                Some((cmd, vec![]))
+            }
+            PortSteer::BindAddr => {
+                let mut cmd = self.run_cmd.clone();
+                cmd.push(format!("127.0.0.1:{p}"));
+                Some((cmd, vec![]))
+            }
+            PortSteer::PortEnv => Some((self.run_cmd.clone(), vec![("PORT".into(), p)])),
+        }
+    }
 }
 
 fn available(bin: &str) -> bool {
@@ -101,6 +150,7 @@ pub fn resolve(ev: &Evidence) -> Option<StackProfile> {
             install_cmd: Some(vec!["cargo".into(), "build".into()]),
             run_cmd: vec!["cargo".into(), "run".into()],
             default_port: None,
+            port_steer: PortSteer::PortEnv,
             confidence: Confidence::Exact,
             warnings,
             hash_source: Some(ev.root.join("Cargo.lock")).filter(|p| p.exists())
@@ -117,6 +167,7 @@ pub fn resolve(ev: &Evidence) -> Option<StackProfile> {
             install_cmd: Some(vec!["go".into(), "mod".into(), "download".into()]),
             run_cmd: vec!["go".into(), "run".into(), ".".into()],
             default_port: None,
+            port_steer: PortSteer::PortEnv,
             confidence: Confidence::Inferred,
             warnings: if available("go") { vec![] } else { vec!["go not found on PATH".into()] },
             hash_source: Some(ev.root.join("go.sum")).filter(|p| p.exists())
@@ -133,6 +184,7 @@ pub fn resolve(ev: &Evidence) -> Option<StackProfile> {
             install_cmd: Some(vec!["bundle".into(), "install".into()]),
             run_cmd: vec!["bundle".into(), "exec".into(), "ruby".into(), "app.rb".into()],
             default_port: Some(4567),
+            port_steer: PortSteer::ArgFlag("-p"),
             confidence: Confidence::Guessed,
             warnings: vec!["ruby entrypoint guessed as app.rb".into()],
             hash_source: Some(ev.root.join("Gemfile.lock")).filter(|p| p.exists())
@@ -149,6 +201,7 @@ pub fn resolve(ev: &Evidence) -> Option<StackProfile> {
             install_cmd: None,
             run_cmd: vec![], // MILKMAN's own static server
             default_port: None,
+            port_steer: PortSteer::Fixed, // the icebox picks a free port itself
             confidence: Confidence::Exact,
             warnings: vec![],
             hash_source: None,
@@ -188,20 +241,20 @@ fn resolve_node(ev: &Evidence) -> StackProfile {
     // framework + script
     let pj = ev.package_json.clone().unwrap_or_default();
     let dep = |name: &str| pj.deps.iter().any(|d| d == name);
-    let (framework, default_port) = if dep("next") {
-        (Some("next".into()), Some(3000))
+    let (framework, default_port, port_steer) = if dep("next") {
+        (Some("next".into()), Some(3000), PortSteer::ScriptFlag("-p"))
     } else if dep("@sveltejs/kit") {
-        (Some("sveltekit".into()), Some(5173))
+        (Some("sveltekit".into()), Some(5173), PortSteer::ScriptFlag("--port"))
     } else if dep("astro") {
-        (Some("astro".into()), Some(4321))
+        (Some("astro".into()), Some(4321), PortSteer::ScriptFlag("--port"))
     } else if dep("nuxt") {
-        (Some("nuxt".into()), Some(3000))
+        (Some("nuxt".into()), Some(3000), PortSteer::ScriptFlag("--port"))
     } else if dep("react-scripts") {
-        (Some("cra".into()), Some(3000))
+        (Some("cra".into()), Some(3000), PortSteer::PortEnv)
     } else if dep("vite") {
-        (Some("vite".into()), Some(5173))
+        (Some("vite".into()), Some(5173), PortSteer::ScriptFlag("--port"))
     } else {
-        (None, None)
+        (None, None, PortSteer::PortEnv)
     };
 
     let script = ["dev", "start", "serve", "preview"]
@@ -237,6 +290,7 @@ fn resolve_node(ev: &Evidence) -> StackProfile {
         install_cmd: Some(vec![manager, "install".into()]),
         run_cmd,
         default_port,
+        port_steer,
         confidence,
         warnings,
         hash_source,
@@ -292,22 +346,26 @@ fn resolve_python(ev: &Evidence) -> StackProfile {
     let mut confidence = Confidence::Inferred;
     let mut framework: Option<String> = None;
     let mut default_port: Option<u16> = None;
+    let mut port_steer = PortSteer::Fixed;
 
     let run_cmd: Vec<String> = if ev.manage_py {
         framework = Some("django".into());
         default_port = Some(8000);
+        port_steer = PortSteer::BindAddr;
         with_prefix(vec!["python", "manage.py", "runserver"])
     } else if let Some(entry) = &ev.py_entry {
         match entry.kind {
             PyKind::FastApi => {
                 framework = Some("fastapi".into());
                 default_port = Some(8000);
+                port_steer = PortSteer::ArgFlag("--port");
                 let target = format!("{}:app", entry.module);
                 with_prefix(vec!["uvicorn", &target, "--reload"])
             }
             PyKind::Flask => {
                 framework = Some("flask".into());
                 default_port = Some(5000);
+                port_steer = PortSteer::ArgFlag("--port");
                 with_prefix(vec!["python", "-m", "flask", "--app", &entry.file, "run"])
             }
             PyKind::Plain => {
@@ -333,6 +391,7 @@ fn resolve_python(ev: &Evidence) -> StackProfile {
         install_cmd,
         run_cmd,
         default_port,
+        port_steer,
         confidence,
         warnings,
         hash_source: [
@@ -355,5 +414,66 @@ impl Confidence {
             (Inferred, _) | (_, Inferred) => Inferred,
             _ => Exact,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scanner::PackageJson;
+
+    fn node_ev(deps: &[&str], scripts: &[&str]) -> Evidence {
+        Evidence {
+            root: std::env::temp_dir(),
+            package_json: Some(PackageJson {
+                scripts: scripts.iter().map(|s| s.to_string()).collect(),
+                deps: deps.iter().map(|s| s.to_string()).collect(),
+            }),
+            lock_npm: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn vite_steers_with_script_flag() {
+        let p = resolve(&node_ev(&["vite"], &["dev"])).expect("node profile");
+        let (cmd, env) = p.run_with_port(4001).expect("steerable");
+        assert!(
+            cmd.ends_with(&["--".into(), "--port".into(), "4001".into()]),
+            "unexpected retry cmd: {cmd:?}"
+        );
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn cra_steers_with_port_env() {
+        let p = resolve(&node_ev(&["react-scripts"], &["start"])).expect("node profile");
+        let (cmd, env) = p.run_with_port(4001).expect("steerable");
+        assert_eq!(cmd, p.run_cmd, "env steering must not alter the command");
+        assert_eq!(env, vec![("PORT".to_string(), "4001".to_string())]);
+    }
+
+    #[test]
+    fn django_steers_with_bind_addr() {
+        let ev = Evidence {
+            root: std::env::temp_dir(),
+            manage_py: true,
+            requirements: true,
+            ..Default::default()
+        };
+        let p = resolve(&ev).expect("python profile");
+        let (cmd, _) = p.run_with_port(4001).expect("steerable");
+        assert_eq!(cmd.last().map(String::as_str), Some("127.0.0.1:4001"));
+    }
+
+    #[test]
+    fn static_and_plain_python_are_fixed() {
+        let ev = Evidence {
+            root: std::env::temp_dir(),
+            index_html: true,
+            ..Default::default()
+        };
+        let p = resolve(&ev).expect("static profile");
+        assert!(p.run_with_port(4001).is_none(), "icebox needs no steering");
     }
 }

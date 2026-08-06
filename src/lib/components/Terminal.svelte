@@ -1,5 +1,6 @@
 <script lang="ts">
   import { crate } from "../bottles.svelte";
+  import { stopBottle } from "../ipc";
   import type { Line } from "../types";
 
   const FRAMES = ["\u2500", "\\", "\u2502", "/"];
@@ -46,8 +47,16 @@
   }
 </script>
 
-<div class="frame">
-  <span class="title">&#9552;[ MILKMAN v0.0.1 ]&#9552;</span>
+<div class="terminal">
+  <span class="title">&#9552;[ MILKMAN v0.0.1{bottle ? ` · ${bottle.name}` : ""} ]&#9552;</span>
+  {#if bottle && running}
+    <button
+      class="cancel"
+      onclick={() => bottle && stopBottle(bottle.id)}
+      title="interrupt the route — hotkey: ctrl+c"
+    >&#9552;[ ^C CANCEL ]&#9552;</button>
+  {/if}
+  <div class="frame">
 
   <div
     class="screen"
@@ -84,9 +93,17 @@
   </div>
 
   <div class="scanlines" aria-hidden="true"></div>
+  </div>
 </div>
 
 <style>
+  /* the wrapper never clips, so the title and cancel tab can straddle the
+     frame's top border without being cut off by .frame's overflow:hidden */
+  .terminal {
+    position: relative;
+    height: 100%;
+  }
+
   .frame {
     position: relative;
     height: 100%;
@@ -97,7 +114,7 @@
 
   .title {
     position: absolute;
-    top: -2px;
+    top: 0;
     left: 18px;
     transform: translateY(-50%);
     background: var(--chrome);
@@ -107,6 +124,31 @@
     color: var(--cream);
     z-index: 2;
     line-height: 1;
+    max-width: calc(100% - 160px);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .cancel {
+    position: absolute;
+    top: 0;
+    right: 18px;
+    transform: translateY(-50%);
+    background: var(--chrome);
+    border: none;
+    padding: 0 6px;
+    font-family: var(--mono);
+    font-weight: 400;
+    font-size: var(--cell);
+    letter-spacing: normal;
+    color: var(--spoiled);
+    z-index: 2;
+    line-height: 1;
+    cursor: pointer;
+  }
+  .cancel:hover {
+    color: var(--cream);
   }
 
   .screen {
@@ -150,6 +192,9 @@
   }
   .ln.url {
     color: var(--cold);
+  }
+  .ln.sig {
+    color: var(--spoiled);
   }
   .ln.fold {
     color: var(--skim);

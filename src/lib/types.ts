@@ -17,7 +17,8 @@ export type LineKind =
   | "note"
   | "raw"
   | "url"
-  | "fold";
+  | "fold"
+  | "sig";
 
 export interface Line {
   kind: LineKind;
